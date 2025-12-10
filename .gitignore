@@ -1,0 +1,20 @@
+# Ignore model weight files
+*.pth
+*.pt
+*.ckpt
+*.onnx
+
+# Ignore logs
+*.log
+
+# Ignore datasets
+data/
+datasets/
+
+# Ignore Python cache
+__pycache__/
+*.pyc
+
+# Ignore Jupyter checkpoints
+.ipynb_checkpoints/
+
