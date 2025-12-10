@@ -1,0 +1,244 @@
+import argparse
+import copy
+import os
+
+import mmcv
+import numpy as np
+import torch
+from mmcv import Config
+from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
+from mmcv.runner import load_checkpoint, wrap_fp16_model
+from mmdet3d.apis import single_gpu_test
+#from torchpack import distributed as dist
+#from torchpack.utils.config import configs
+from tqdm import tqdm
+import mmdet
+from mmdet3d.core import LiDARInstance3DBoxes
+from visualization import visualize_camera, visualize_lidar, visualize_map
+from mmdet3d.datasets import build_dataloader, build_dataset
+from mmdet3d.models import build_model
+from mmdet.datasets import replace_ImageToTensor
+import pickle
+import debugpy
+
+if mmdet.__version__ > '2.23.0':
+    # If mmdet version > 2.23.0, setup_multi_processes would be imported and
+    # used from mmdet instead of mmdet3d.
+    from mmdet.utils import setup_multi_processes
+else:
+    from mmdet3d.utils import setup_multi_processes
+
+try:
+    # If mmdet version > 2.23.0, compat_cfg would be imported and
+    # used from mmdet instead of mmdet3d.
+    from mmdet.utils import compat_cfg
+except ImportError:
+    from mmdet3d.utils import compat_cfg
+
+def recursive_eval(obj, globals=None):
+    if globals is None:
+        globals = copy.deepcopy(obj)
+
+    if isinstance(obj, dict):
+        for key in obj:
+            obj[key] = recursive_eval(obj[key], globals)
+    elif isinstance(obj, list):
+        for k, val in enumerate(obj):
+            obj[k] = recursive_eval(val, globals)
+    elif isinstance(obj, str) and obj.startswith("${") and obj.endswith("}"):
+        obj = eval(obj[2:-1], globals)
+        obj = recursive_eval(obj, globals)
+
+    return obj
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("config", metavar="FILE")
+    parser.add_argument("--mode", type=str, default="gt", choices=["gt", "pred"])
+    parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument("--split", type=str, default="val", choices=["train", "val"])
+    parser.add_argument("--bbox-classes", nargs="+", type=int, default=None)
+    parser.add_argument("--bbox-score", type=float, default=None)
+    parser.add_argument("--map-score", type=float, default=0.5)
+    parser.add_argument('--show', action='store_true', help='show results')
+    parser.add_argument("--out-dir", type=str, default="viz")
+    parser.add_argument('--gpu-id',type=int,default=0,help='id of gpu to use ''(only applicable to non-distributed testing)')
+    args = parser.parse_args()
+    return args
+
+def main() -> None:
+    args = parse_args()
+
+    cfg = Config.fromfile(args.config)
+    
+    cfg = compat_cfg(cfg)
+
+    # set multi-process settings
+    setup_multi_processes(cfg)
+    if cfg.get('custom_imports', None):
+        from mmcv.utils import import_modules_from_strings
+        import_modules_from_strings(**cfg['custom_imports'])
+
+    # import modules from plguin/xx, registry will be updated
+    if hasattr(cfg, 'plugin'):
+        if cfg.plugin:
+            import importlib
+            if hasattr(cfg, 'plugin_dir'):
+                plugin_dir = cfg.plugin_dir
+                _module_dir = os.path.dirname(plugin_dir)
+                _module_dir = _module_dir.split('/')
+                _module_path = _module_dir[0]
+
+                for m in _module_dir[1:]:
+                    _module_path = _module_path + '.' + m
+                print(_module_path)
+                plg_lib = importlib.import_module(_module_path)
+            else:
+                # import dir is the dirpath for the config file
+                _module_dir = os.path.dirname(args.config)
+                _module_dir = _module_dir.split('/')
+                _module_path = _module_dir[0]
+                for m in _module_dir[1:]:
+                    _module_path = _module_path + '.' + m
+                print(_module_path)
+                plg_lib = importlib.import_module(_module_path)
+
+    if cfg.get('cudnn_benchmark', False):
+        torch.backends.cudnn.benchmark = True
+
+    cfg.model.pretrained = None
+
+    cfg.gpu_ids = [args.gpu_id]
+
+    distributed = False
+    test_dataloader_default_args = dict(
+        samples_per_gpu=1, workers_per_gpu=2, dist=distributed, shuffle=False)
+    
+    if isinstance(cfg.data.test, dict):
+        cfg.data.test.test_mode = True
+        if cfg.data.test_dataloader.get('samples_per_gpu', 1) > 1:
+            # Replace 'ImageToTensor' to 'DefaultFormatBundle'
+            cfg.data.test.pipeline = replace_ImageToTensor(
+                cfg.data.test.pipeline)
+    elif isinstance(cfg.data.test, list):
+        for ds_cfg in cfg.data.test:
+            ds_cfg.test_mode = True
+        if cfg.data.test_dataloader.get('samples_per_gpu', 1) > 1:
+            for ds_cfg in cfg.data.test:
+                ds_cfg.pipeline = replace_ImageToTensor(ds_cfg.pipeline)
+
+    test_loader_cfg = {
+        **test_dataloader_default_args,
+        **cfg.data.get('test_dataloader', {})
+    }
+    
+    
+    # build the dataloader
+    
+    dataset = build_dataset(cfg.data[args.split])
+    # dataflow = build_dataloader(
+    #     dataset,
+    #     samples_per_gpu=1,
+    #     workers_per_gpu=cfg.data.workers_per_gpu,
+    #     dist=True,
+    #     shuffle=False,
+    # )
+    dataflow = build_dataloader(dataset, **test_loader_cfg)
+    
+    # build the model and load checkpoint
+    cfg.model.train_cfg = None
+    if args.mode == "pred":
+        model = build_model(cfg.model, test_cfg=cfg.get('test_cfg'))
+        fp16_cfg = cfg.get("fp16", None)
+        if fp16_cfg is not None:
+            wrap_fp16_model(model)
+        load_checkpoint(model, args.checkpoint, map_location="cpu")
+
+        # model = MMDistributedDataParallel(
+        #     model.cuda(),
+        #     device_ids=[torch.cuda.current_device()],
+        #     broadcast_buffers=False,
+        # )
+        model = MMDataParallel(model, device_ids=cfg.gpu_ids)
+        model.eval()
+
+    for data in tqdm(dataflow):
+        metas = data["img_metas"].data[0][0]
+        name = "{}-{}".format(metas["timestamp"], metas["scene_token"])
+
+        if args.mode == "pred":
+            with torch.no_grad():
+                outputs = model(return_loss=False, rescale=True, **data)
+
+        
+        if args.mode == "gt" and "gt_bboxes_3d" in data:
+            bboxes = data["gt_bboxes_3d"].data[0][0][0].tensor.numpy()
+            labels = data["gt_labels_3d"].data[0][0][0].numpy()
+            
+            #args.bbox_classes = 0
+            if args.bbox_classes is not None:
+                indices = np.isin(labels, args.bbox_classes)
+                bboxes = bboxes[indices]
+                labels = labels[indices]
+
+            bboxes[..., 2] -= bboxes[..., 5] / 2
+            bboxes = LiDARInstance3DBoxes(bboxes, box_dim=9)
+        elif args.mode == "pred" and "boxes_3d" in outputs[0]:
+            bboxes = outputs[0]["boxes_3d"].tensor.detach().numpy()
+            scores = outputs[0]["scores_3d"].detach().numpy()
+            labels = outputs[0]["labels_3d"].detach().numpy()
+
+            if args.bbox_classes is not None:
+                indices = np.isin(labels, args.bbox_classes)
+                bboxes = bboxes[indices]
+                scores = scores[indices]
+                labels = labels[indices]
+
+            
+            if args.bbox_score is not None:
+                
+                indices = scores >= args.bbox_score
+                bboxes = bboxes[indices]
+                scores = scores[indices]
+                labels = labels[indices]
+
+            bboxes[..., 2] -= bboxes[..., 5] / 2
+            bboxes = LiDARInstance3DBoxes(bboxes, box_dim=9)
+        else:
+            bboxes = None
+            labels = None
+
+        if args.mode == "gt" and "gt_masks_bev" in data:
+            masks = data["gt_masks_bev"].data[0].numpy()
+            # masks = masks.astype(np.bool)
+            masks = masks.astype(bool)
+            masks = masks
+        elif args.mode == "pred" and "masks_bev" in outputs[0]:
+            masks = outputs[0]["masks_bev"].numpy()
+            masks = masks >= args.map_score
+        else:
+            masks = None
+        if "img" in data:
+            for k, image_path in enumerate(metas["filename"]):
+                for i in range(10):  # camera numbers
+                    image = mmcv.imread(image_path[i])
+                    
+                    visualize_camera(
+                        os.path.join(args.out_dir, f"camera-{i}", f"{name}.png"),
+                        image,
+                        bboxes=bboxes,
+                        labels=labels,
+                        transform=metas["lidar2img"][k][i].squeeze(),
+                        classes=cfg.class_names,
+                    )
+
+        if masks is not None:
+            visualize_map(
+                os.path.join(args.out_dir, "map", f"{name}.png"),
+                masks,
+                classes=cfg.map_classes,
+            )
+
+
+if __name__ == "__main__":
+    main()

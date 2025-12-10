@@ -1,0 +1,40 @@
+For training:
+Baseline
+python3 extra_tools/train.py /home/jmeng18/DQTrack-main/mmdetection3d/projects/configs/dqtrack/detr3d_r101_size_900_1600_dq.py --work-dir /home/jmeng18/DQTrack-main/mmdetection3d/work_dirs_scratch
+
+V2X
+python3 extra_tools/train.py /home/jmeng18/DQTrack-main/mmdetection3d/projects/configs/dqtrack/detr3d_r101_size_900_1600_dq_v2x.py --work-dir /home/jmeng18/DQTrack-main/mmdetection3d/work_dirs_v2x
+
+bash extra_tools/dist_train.sh /home/jmeng18/DQTrack-main/mmdetection3d/projects/configs/dqtrack/detr3d_r101_size_900_1600_dq_v2x.py 3 --work-dir /home/jmeng18/DQTrack-main/mmdetection3d/work_dirs_v2x_loss_check
+
+Notes
+1./home/jmeng18/DQTrack-main/mmdetection3d/mmdet3d/models/detectors/mvx_two_stage.py  self.pts_bbox_head
+2.change /home/jmeng18/DQTrack-main/mmdetection3d/projects/mmdet3d_plugin/models/trackers/detr3d_tracker_dq.py
+
+ps aux | grep "extra_tools/train.py" | grep -v grep | awk '{print $2}' | xargs kill -9
+
+For testing:
+Baseline
+python3 extra_tools/test.py /home/jmeng18/DQTrack-main/mmdetection3d/work_dirs_scratch/detr3d_r101_size_900_1600_dq.py --checkpoint /home/jmeng18/DQTrack-main/mmdetection3d/work_dirs_scratch/latest.pth --tmpdir /home/jmeng18/DQTrack-main/mmdetection3d/work_dirs_scratch 
+
+V2X
+python3 extra_tools/test.py /home/jmeng18/DQTrack-main/mmdetection3d/work_dirs_v2x/detr3d_r101_size_900_1600_dq_v2x.py --checkpoint /home/jmeng18/DQTrack-main/mmdetection3d/work_dirs_v2x/latest.pth --tmpdir /home/jmeng18/DQTrack-main/mmdetection3d/work_dirs_v2x
+
+Notes
+1./home/jmeng18/DQTrack-main/mmdetection3d/mmdet3d/models/detectors/mvx_two_stage.py  self.pts_bbox_head
+2.change /home/jmeng18/DQTrack-main/mmdetection3d/projects/mmdet3d_plugin/models/trackers/detr3d_tracker_dq.py
+3.change /home/jmeng18/DQTrack-main/mmdetection3d/projects/mmdet3d_plugin/datasets/nuscenes_dataset_track.py line 855 target_files = '/home/jmeng18/DQTrack-main/mmdetection3d/work_dirs_v2x/result.json'
+
+for detection test
+4.change eval_det_only=True in config file
+5.change /home/jmeng18/DQTrack-main/mmdetection3d/projects/mmdet3d_plugin/datasets/nuscenes_dataset_track.py 'eval_task=det'
+
+
+
+
+For visualization
+Baseline
+python3 extra_tools/visualize.py /home/jmeng18/DQTrack-main/mmdetection3d/work_dirs_scratch/detr3d_r101_size_900_1600_dq.py --checkpoint /home/jmeng18/DQTrack-main/mmdetection3d/work_dirs_scratch/latest.pth --out-dir viz_baseline --mode pred
+
+V2X
+python3 extra_tools/visualize.py /home/jmeng18/DQTrack-main/mmdetection3d/work_dirs_v2x/detr3d_r101_size_900_1600_dq.py --checkpoint /home/jmeng18/DQTrack-main/mmdetection3d/work_dirs_v2x/latest.pth --out-dir viz_v2x --mode pred
